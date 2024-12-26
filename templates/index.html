@@ -1,0 +1,45 @@
+{% extends "base.html" %} {% block content %}
+<div class="container">
+  <h1>Game of Thrones Real Estate Game API</h1>
+
+  <p>
+    A text-based game where Jon Snow ventures into modern-day real estate. Make
+    choices to balance happiness and wealth!
+  </p>
+
+  <h2>How to Play</h2>
+
+  <div class="endpoint">
+    <h3>1. Start New Game</h3>
+    <pre><code>curl -X POST \
+http://localhost:5000/api/game \
+-H "Content-Type: application/json" \
+-d '{}'</code></pre>
+  </div>
+
+  <div class="endpoint">
+    <h3>2. Make a Choice</h3>
+    <pre><code>curl -X POST \
+http://localhost:5000/api/game \
+-H "Content-Type: application/json" \
+-d '{"choice": "1"}'</code></pre>
+    <p>Replace "1" with your choice number (1-3)</p>
+  </div>
+
+  <div class="endpoint">
+    <h3>3. Reset Game</h3>
+    <pre><code>curl -X POST \
+http://localhost:5000/api/reset \
+-H "Content-Type: application/json" \
+-d '{}'</code></pre>
+  </div>
+
+  <h2>Game Rules</h2>
+  <ul>
+    <li>Starting stats: Happiness (30/100) and Wealth ($100,000)</li>
+    <li>Game runs for maximum 10 turns</li>
+    <li>Win condition: Happiness > 80 AND Wealth > $150,000</li>
+    <li>Lose if: Happiness reaches 0 OR Wealth reaches 0</li>
+  </ul>
+</div>
+{% endblock %}
