@@ -4,9 +4,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
-from fastapi_cache import FastAPICache
-from fastapi_cache.decorator import cache
-from fastapi_cache.backends.inmemory import InMemoryBackend
 from pydantic import BaseModel
 from typing import Optional, Dict
 import uvicorn
@@ -16,26 +13,22 @@ import sqlite3
 import json
 from uuid import uuid4
 from openai import AsyncOpenAI
-
-from contextlib import asynccontextmanager
-
 from collections import defaultdict
 from datetime import datetime, timedelta
+from contextlib import asynccontextmanager
+from fastapi.responses import JSONResponse
 
+# Cache setup
 cache = defaultdict(dict)
 cache_expiry = defaultdict(dict)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    FastAPICache.init(InMemoryBackend(), prefix="fastapi-cache")
     yield
 
 
-# Create app with lifespan
 app = FastAPI(lifespan=lifespan)
-
-
 templates = Jinja2Templates(directory="templates")
 SESSION_KEY = APIKeyHeader(name="X-Session-ID", auto_error=False)
 
@@ -79,6 +72,7 @@ class ModernWesterosGame:
         self.wealth = 100000
         self.turn_count = 0
         self.game_id = str(uuid4())
+
         self.setup_database()
 
     def get_state(self) -> GameState:
@@ -297,80 +291,54 @@ Be creative and humorous while keeping the real estate aspects realistic.""",
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request, session_id: str = Depends(get_session_id)):
+async def index(request: Request):
+    session_id = request.cookies.get("session_id", str(uuid4()))
     response = templates.TemplateResponse("index.html", {"request": request})
-    response.headers["X-Session-ID"] = session_id
+    response.set_cookie("session_id", session_id)
     return response
 
 
 @app.post("/api/game")
-async def game_action(
-    game_choice: GameChoice, session_id: str = Depends(get_session_id)
-):
+async def game_action(game_choice: GameChoice, request: Request):
+    session_id = request.cookies.get("session_id")
+    if not session_id:
+        session_id = str(uuid4())
+
     try:
         current_time = datetime.now()
-        game_state = (
-            cache.get(session_id, {}).get("game_state")
-            if cache_expiry.get(session_id, {}).get("game_state", current_time)
-            > current_time
-            else None
-        )
-        current_segment = (
-            cache.get(session_id, {}).get("current_segment")
-            if cache_expiry.get(session_id, {}).get("current_segment", current_time)
-            > current_time
-            else None
-        )
 
-        if not game_choice.choice or not game_state:
+        if session_id in cache and current_time < cache_expiry[session_id].get(
+            "game_state", current_time
+        ):
+            game = ModernWesterosGame()
+            game.load_state(GameState(**cache[session_id]["game_state"]))
+            current_segment = cache[session_id]["current_segment"]
+
+            if game_choice.choice:
+                if game_choice.choice not in ["1", "2", "3"]:
+                    raise HTTPException(status_code=400, detail="Invalid choice")
+
+                choices = current_segment.split("CHOICES:\n")[1].split("\n")
+                chosen_action = choices[int(game_choice.choice) - 1].lstrip("123. ")
+                consequence, next_segment = await game.make_choice(chosen_action)
+            else:
+                next_segment = current_segment
+                consequence = None
+        else:
             game = ModernWesterosGame()
             current_segment = await game.start_game()
+            consequence = None
+            next_segment = current_segment
 
-            expiry = current_time + timedelta(hours=1)
-            cache[session_id]["game_state"] = game.get_state().dict()
-            cache[session_id]["current_segment"] = current_segment
-            cache_expiry[session_id]["game_state"] = expiry
-            cache_expiry[session_id]["current_segment"] = expiry
-
-            return {
-                "status": "success",
-                "session_id": session_id,
-                "game_state": {
-                    "turn": game.turn_count + 1,
-                    "happiness": game.happiness,
-                    "wealth": game.wealth,
-                    "story": current_segment.split("STORY:")[1]
-                    .split("CHOICES:")[0]
-                    .strip(),
-                    "choices": [
-                        choice.strip()
-                        for choice in current_segment.split("CHOICES:\n")[1].split("\n")
-                        if choice.strip()
-                    ][:3],
-                },
-            }
-
-        if game_choice.choice not in ["1", "2", "3"]:
-            raise HTTPException(status_code=400, detail="Invalid choice")
-
-        game = ModernWesterosGame()
-        game.load_state(GameState(**game_state))
-
-        choices = current_segment.split("CHOICES:\n")[1].split("\n")
-        chosen_action = choices[int(game_choice.choice) - 1].lstrip("123. ")
-
-        consequence, next_segment = await game.make_choice(chosen_action)
-
-        await FastAPICache.set_with_namespace(
-            f"game_state:{session_id}", game.get_state().dict()
-        )
-        await FastAPICache.set_with_namespace(
-            f"current_segment:{session_id}", next_segment
-        )
+        expiry = current_time + timedelta(hours=1)
+        cache[session_id] = {
+            "game_state": game.get_state().dict(),
+            "current_segment": next_segment,
+        }
+        cache_expiry[session_id] = {"game_state": expiry, "current_segment": expiry}
 
         is_game_over, message = game.check_game_over()
-
-        return {
+        response_data = {
             "status": "success",
             "session_id": session_id,
             "game_state": {
@@ -389,16 +357,23 @@ async def game_action(
             },
         }
 
+        response = JSONResponse(content=response_data)
+        response.set_cookie("session_id", session_id)
+        return response
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/reset")
-async def reset_game(session_id: str = Depends(get_session_id)):
-    if session_id in cache:
+async def reset_game(request: Request):
+    session_id = request.cookies.get("session_id")
+    if session_id and session_id in cache:
         del cache[session_id]
         del cache_expiry[session_id]
-    return {"status": "success", "message": "Game reset successfully"}
+    response = JSONResponse({"status": "success", "message": "Game reset successfully"})
+    response.delete_cookie("session_id")
+    return response
 
 
 if __name__ == "__main__":
