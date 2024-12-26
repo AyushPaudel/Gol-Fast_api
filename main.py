@@ -1,21 +1,44 @@
-from fastapi import FastAPI, HTTPException, Response, Request
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
+from fastapi_cache import FastAPICache
+from fastapi_cache.decorator import cache
+from fastapi_cache.backends.inmemory import InMemoryBackend
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from typing import Optional, Dict
 import uvicorn
 from dotenv import load_dotenv
 import os
 import sqlite3
 import json
+from uuid import uuid4
 from openai import AsyncOpenAI
 
-app = FastAPI()
-templates = Jinja2Templates(directory="templates")
+from contextlib import asynccontextmanager
 
-# CORS middleware
+from collections import defaultdict
+from datetime import datetime, timedelta
+
+cache = defaultdict(dict)
+cache_expiry = defaultdict(dict)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    FastAPICache.init(InMemoryBackend(), prefix="fastapi-cache")
+    yield
+
+
+# Create app with lifespan
+app = FastAPI(lifespan=lifespan)
+
+
+templates = Jinja2Templates(directory="templates")
+SESSION_KEY = APIKeyHeader(name="X-Session-ID", auto_error=False)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,7 +47,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
@@ -40,20 +62,23 @@ class GameChoice(BaseModel):
     choice: Optional[str] = None
 
 
+async def get_session_id(session_id: str = Depends(SESSION_KEY)) -> str:
+    return session_id or str(uuid4())
+
+
 class ModernWesterosGame:
     def __init__(self):
         load_dotenv()
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
-            raise ValueError("OpenAI API key not found in environment variables")
+            raise ValueError("OpenAI API key not found")
 
         self.client = AsyncOpenAI(api_key=api_key)
         self.player_history = []
         self.happiness = 30
         self.wealth = 100000
         self.turn_count = 0
-        self.game_id = os.urandom(16).hex()
-
+        self.game_id = str(uuid4())
         self.setup_database()
 
     def get_state(self) -> GameState:
@@ -272,26 +297,44 @@ Be creative and humorous while keeping the real estate aspects realistic.""",
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+async def index(request: Request, session_id: str = Depends(get_session_id)):
+    response = templates.TemplateResponse("index.html", {"request": request})
+    response.headers["X-Session-ID"] = session_id
+    return response
 
 
 @app.post("/api/game")
-async def game_action(game_choice: GameChoice, request: Request):
+async def game_action(
+    game_choice: GameChoice, session_id: str = Depends(get_session_id)
+):
     try:
-        # Get game state from request state
-        game_state = getattr(request.state, "game_state", None)
-        current_segment = getattr(request.state, "current_segment", None)
+        current_time = datetime.now()
+        game_state = (
+            cache.get(session_id, {}).get("game_state")
+            if cache_expiry.get(session_id, {}).get("game_state", current_time)
+            > current_time
+            else None
+        )
+        current_segment = (
+            cache.get(session_id, {}).get("current_segment")
+            if cache_expiry.get(session_id, {}).get("current_segment", current_time)
+            > current_time
+            else None
+        )
 
         if not game_choice.choice or not game_state:
             game = ModernWesterosGame()
             current_segment = await game.start_game()
 
-            request.state.game_state = game.get_state()
-            request.state.current_segment = current_segment
+            expiry = current_time + timedelta(hours=1)
+            cache[session_id]["game_state"] = game.get_state().dict()
+            cache[session_id]["current_segment"] = current_segment
+            cache_expiry[session_id]["game_state"] = expiry
+            cache_expiry[session_id]["current_segment"] = expiry
 
             return {
                 "status": "success",
+                "session_id": session_id,
                 "game_state": {
                     "turn": game.turn_count + 1,
                     "happiness": game.happiness,
@@ -311,20 +354,25 @@ async def game_action(game_choice: GameChoice, request: Request):
             raise HTTPException(status_code=400, detail="Invalid choice")
 
         game = ModernWesterosGame()
-        game.load_state(game_state)
+        game.load_state(GameState(**game_state))
 
         choices = current_segment.split("CHOICES:\n")[1].split("\n")
         chosen_action = choices[int(game_choice.choice) - 1].lstrip("123. ")
 
         consequence, next_segment = await game.make_choice(chosen_action)
 
-        request.state.game_state = game.get_state()
-        request.state.current_segment = next_segment
+        await FastAPICache.set_with_namespace(
+            f"game_state:{session_id}", game.get_state().dict()
+        )
+        await FastAPICache.set_with_namespace(
+            f"current_segment:{session_id}", next_segment
+        )
 
         is_game_over, message = game.check_game_over()
 
         return {
             "status": "success",
+            "session_id": session_id,
             "game_state": {
                 "turn": game.turn_count + 1,
                 "happiness": game.happiness,
@@ -346,11 +394,12 @@ async def game_action(game_choice: GameChoice, request: Request):
 
 
 @app.post("/api/reset")
-async def reset_game(request: Request):
-    request.state.game_state = None
-    request.state.current_segment = None
+async def reset_game(session_id: str = Depends(get_session_id)):
+    if session_id in cache:
+        del cache[session_id]
+        del cache_expiry[session_id]
     return {"status": "success", "message": "Game reset successfully"}
 
 
 if __name__ == "__main__":
-    uvicorn.run("game:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
