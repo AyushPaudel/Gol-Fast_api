@@ -1,21 +1,37 @@
-from fastapi import FastAPI, HTTPException, Response, Request
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from typing import Optional, Dict
 import uvicorn
 from dotenv import load_dotenv
 import os
 import sqlite3
 import json
+from uuid import uuid4
 from openai import AsyncOpenAI
+from collections import defaultdict
+from datetime import datetime, timedelta
+from contextlib import asynccontextmanager
+from fastapi.responses import JSONResponse
 
-app = FastAPI()
+# Cache setup
+cache = defaultdict(dict)
+cache_expiry = defaultdict(dict)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 templates = Jinja2Templates(directory="templates")
+SESSION_KEY = APIKeyHeader(name="X-Session-ID", auto_error=False)
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,7 +40,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
@@ -40,19 +55,23 @@ class GameChoice(BaseModel):
     choice: Optional[str] = None
 
 
+async def get_session_id(session_id: str = Depends(SESSION_KEY)) -> str:
+    return session_id or str(uuid4())
+
+
 class ModernWesterosGame:
     def __init__(self):
         load_dotenv()
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
-            raise ValueError("OpenAI API key not found in environment variables")
+            raise ValueError("OpenAI API key not found")
 
         self.client = AsyncOpenAI(api_key=api_key)
         self.player_history = []
         self.happiness = 30
         self.wealth = 100000
         self.turn_count = 0
-        self.game_id = os.urandom(16).hex()
+        self.game_id = str(uuid4())
 
         self.setup_database()
 
@@ -273,58 +292,55 @@ Be creative and humorous while keeping the real estate aspects realistic.""",
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    session_id = request.cookies.get("session_id", str(uuid4()))
+    response = templates.TemplateResponse("index.html", {"request": request})
+    response.set_cookie("session_id", session_id)
+    return response
 
 
 @app.post("/api/game")
 async def game_action(game_choice: GameChoice, request: Request):
-    try:
-        # Get game state from request state
-        game_state = getattr(request.state, "game_state", None)
-        current_segment = getattr(request.state, "current_segment", None)
+    session_id = request.cookies.get("session_id")
+    if not session_id:
+        session_id = str(uuid4())
 
-        if not game_choice.choice or not game_state:
+    try:
+        current_time = datetime.now()
+
+        if session_id in cache and current_time < cache_expiry[session_id].get(
+            "game_state", current_time
+        ):
+            game = ModernWesterosGame()
+            game.load_state(GameState(**cache[session_id]["game_state"]))
+            current_segment = cache[session_id]["current_segment"]
+
+            if game_choice.choice:
+                if game_choice.choice not in ["1", "2", "3"]:
+                    raise HTTPException(status_code=400, detail="Invalid choice")
+
+                choices = current_segment.split("CHOICES:\n")[1].split("\n")
+                chosen_action = choices[int(game_choice.choice) - 1].lstrip("123. ")
+                consequence, next_segment = await game.make_choice(chosen_action)
+            else:
+                next_segment = current_segment
+                consequence = None
+        else:
             game = ModernWesterosGame()
             current_segment = await game.start_game()
+            consequence = None
+            next_segment = current_segment
 
-            request.state.game_state = game.get_state()
-            request.state.current_segment = current_segment
-
-            return {
-                "status": "success",
-                "game_state": {
-                    "turn": game.turn_count + 1,
-                    "happiness": game.happiness,
-                    "wealth": game.wealth,
-                    "story": current_segment.split("STORY:")[1]
-                    .split("CHOICES:")[0]
-                    .strip(),
-                    "choices": [
-                        choice.strip()
-                        for choice in current_segment.split("CHOICES:\n")[1].split("\n")
-                        if choice.strip()
-                    ][:3],
-                },
-            }
-
-        if game_choice.choice not in ["1", "2", "3"]:
-            raise HTTPException(status_code=400, detail="Invalid choice")
-
-        game = ModernWesterosGame()
-        game.load_state(game_state)
-
-        choices = current_segment.split("CHOICES:\n")[1].split("\n")
-        chosen_action = choices[int(game_choice.choice) - 1].lstrip("123. ")
-
-        consequence, next_segment = await game.make_choice(chosen_action)
-
-        request.state.game_state = game.get_state()
-        request.state.current_segment = next_segment
+        expiry = current_time + timedelta(hours=1)
+        cache[session_id] = {
+            "game_state": game.get_state().dict(),
+            "current_segment": next_segment,
+        }
+        cache_expiry[session_id] = {"game_state": expiry, "current_segment": expiry}
 
         is_game_over, message = game.check_game_over()
-
-        return {
+        response_data = {
             "status": "success",
+            "session_id": session_id,
             "game_state": {
                 "turn": game.turn_count + 1,
                 "happiness": game.happiness,
@@ -341,16 +357,24 @@ async def game_action(game_choice: GameChoice, request: Request):
             },
         }
 
+        response = JSONResponse(content=response_data)
+        response.set_cookie("session_id", session_id)
+        return response
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/reset")
 async def reset_game(request: Request):
-    request.state.game_state = None
-    request.state.current_segment = None
-    return {"status": "success", "message": "Game reset successfully"}
+    session_id = request.cookies.get("session_id")
+    if session_id and session_id in cache:
+        del cache[session_id]
+        del cache_expiry[session_id]
+    response = JSONResponse({"status": "success", "message": "Game reset successfully"})
+    response.delete_cookie("session_id")
+    return response
 
 
 if __name__ == "__main__":
-    uvicorn.run("game:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
