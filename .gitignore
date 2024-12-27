@@ -1,3 +1,4 @@
 env/
 .env
 westeros_realty.db
+.vercel
